@@ -333,6 +333,42 @@ def run_and_show(image_bgr, models):
     show_results(results)
 
 
+@st.cache_resource(ttl=3600)
+def get_ice_servers():
+    """ICE servers for WebRTC. Needed when the app is deployed (not on localhost).
+
+    - STUN (free, Google) is always included.
+    - TURN relay is added if credentials are found in Streamlit secrets:
+        * Twilio:  TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN   (needs `twilio` package)
+        * Generic: TURN_URLS (list) + TURN_USERNAME + TURN_CREDENTIAL
+    """
+
+    ice_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+
+    try:
+        if "TWILIO_ACCOUNT_SID" in st.secrets and "TWILIO_AUTH_TOKEN" in st.secrets:
+            from twilio.rest import Client
+
+            client = Client(
+                st.secrets["TWILIO_ACCOUNT_SID"],
+                st.secrets["TWILIO_AUTH_TOKEN"]
+            )
+            return client.tokens.create().ice_servers
+
+        if "TURN_URLS" in st.secrets:
+            ice_servers.append({
+                "urls": list(st.secrets["TURN_URLS"]),
+                "username": st.secrets["TURN_USERNAME"],
+                "credential": st.secrets["TURN_CREDENTIAL"],
+            })
+    except Exception:
+        # No secrets configured (e.g. running locally) or TURN setup failed:
+        # fall back to STUN only.
+        pass
+
+    return ice_servers
+
+
 def run_live_camera(models):
     """Live Camera: anti-spoofing + recognition. The video stays clean,
     predictions update below it."""
@@ -362,6 +398,7 @@ def run_live_camera(models):
             "video": {"width": {"ideal": 1280}, "height": {"ideal": 720}},
             "audio": False,
         },
+        rtc_configuration={"iceServers": get_ice_servers()},
         async_processing=True,
     )
 
