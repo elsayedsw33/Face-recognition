@@ -1,3 +1,4 @@
 opencv-python-headless
 onnxruntime
 streamlit-webrtc
+twilio
