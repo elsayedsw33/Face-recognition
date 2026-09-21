@@ -1,3 +1,5 @@
+import base64
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -6,7 +8,7 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import streamlit as st
-from streamlit_webrtc import WebRtcMode, webrtc_streamer
+import streamlit.components.v1 as components
 
 # =========================
 # Paths (model files must sit next to this file)
@@ -333,102 +335,243 @@ def run_and_show(image_bgr, models):
     show_results(results)
 
 
-@st.cache_resource(ttl=3600)
-def get_ice_servers():
-    """ICE servers for WebRTC. Needed when the app is deployed (not on localhost).
+# =========================
+# Live camera (browser camera -> frames over Streamlit's own connection)
+# No WebRTC, so no STUN/TURN servers are needed, locally or deployed.
+# =========================
 
-    - STUN (free, Google) is always included.
-    - TURN relay is added if credentials are found in Streamlit secrets:
-        * Twilio:  TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN   (needs `twilio` package)
-        * Generic: TURN_URLS (list) + TURN_USERNAME + TURN_CREDENTIAL
-    """
+LIVE_INTERVAL_MS = 500     # how often the browser sends one frame to the app
+LIVE_MAX_WIDTH = 640       # frames are downscaled to this width before sending
+LIVE_IDLE_TIMEOUT = 20     # background worker stops after this many seconds without frames
 
-    ice_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+LIVE_CAM_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; font-family: "Source Sans Pro", sans-serif; }
+  #wrap { display: flex; flex-direction: column; gap: 8px; }
+  button { padding: 8px 16px; font-size: 15px; border-radius: 8px; border: 1px solid #bbb;
+           background: #fff; color: #222; cursor: pointer; align-self: flex-start; }
+  button:hover { border-color: #ff4b4b; color: #ff4b4b; }
+  video { width: 100%; border-radius: 8px; background: #000; display: none; }
+  #msg { font-size: 14px; color: #888; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <button id="toggle">Start camera</button>
+  <video id="video" autoplay playsinline muted></video>
+  <div id="msg"></div>
+</div>
+<canvas id="canvas" style="display:none"></canvas>
+<script>
+  function post(type, data) {
+    window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, data || {}), "*");
+  }
+  function setHeight() {
+    post("streamlit:setFrameHeight", {height: document.getElementById("wrap").offsetHeight + 4});
+  }
+  function sendValue(value) {
+    post("streamlit:setComponentValue", {value: value, dataType: "json"});
+  }
+
+  var intervalMs = 500;
+  var maxWidth = 640;
+
+  window.addEventListener("message", function (e) {
+    if (e.data && e.data.type === "streamlit:render") {
+      var a = e.data.args || {};
+      intervalMs = a.interval_ms || intervalMs;
+      maxWidth = a.max_width || maxWidth;
+    }
+  });
+
+  var btn = document.getElementById("toggle");
+  var video = document.getElementById("video");
+  var msg = document.getElementById("msg");
+  var canvas = document.getElementById("canvas");
+  var stream = null;
+  var timer = null;
+
+  function captureFrame() {
+    if (!video.videoWidth) { return; }
+    var scale = Math.min(1, maxWidth / video.videoWidth);
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+    sendValue({id: Date.now(), data: canvas.toDataURL("image/jpeg", 0.8)});
+  }
+
+  async function start() {
+    msg.textContent = "";
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      msg.textContent = "Camera access needs HTTPS (or localhost).";
+      setHeight();
+      return;
+    }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {facingMode: "user", width: {ideal: 1280}, height: {ideal: 720}},
+        audio: false
+      });
+    } catch (err) {
+      msg.textContent = "Could not open the camera: " + err.message;
+      setHeight();
+      return;
+    }
+    video.srcObject = stream;
+    video.style.display = "block";
+    btn.textContent = "Stop camera";
+    timer = setInterval(captureFrame, intervalMs);
+    setHeight();
+  }
+
+  function stop() {
+    clearInterval(timer);
+    timer = null;
+    if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); }
+    stream = null;
+    video.srcObject = null;
+    video.style.display = "none";
+    btn.textContent = "Start camera";
+    sendValue(null);
+    setHeight();
+  }
+
+  btn.addEventListener("click", function () { if (stream) { stop(); } else { start(); } });
+  video.addEventListener("loadedmetadata", setHeight);
+  new ResizeObserver(setHeight).observe(document.getElementById("wrap"));
+
+  post("streamlit:componentReady", {apiVersion: 1});
+  setHeight();
+</script>
+</body>
+</html>
+"""
+
+
+@st.cache_resource
+def get_live_cam_component():
+    """Write the small camera component to a temp folder and register it."""
+
+    component_dir = Path(tempfile.gettempdir()) / "face_live_cam_component"
+    component_dir.mkdir(parents=True, exist_ok=True)
+    (component_dir / "index.html").write_text(LIVE_CAM_HTML, encoding="utf-8")
+
+    return components.declare_component("face_live_cam", path=str(component_dir))
+
+
+def decode_data_url(data_url):
+    """Convert a 'data:image/jpeg;base64,...' string to a BGR OpenCV image."""
 
     try:
-        if "TWILIO_ACCOUNT_SID" in st.secrets and "TWILIO_AUTH_TOKEN" in st.secrets:
-            from twilio.rest import Client
-
-            client = Client(
-                st.secrets["TWILIO_ACCOUNT_SID"],
-                st.secrets["TWILIO_AUTH_TOKEN"]
-            )
-            return client.tokens.create().ice_servers
-
-        if "TURN_URLS" in st.secrets:
-            ice_servers.append({
-                "urls": list(st.secrets["TURN_URLS"]),
-                "username": st.secrets["TURN_USERNAME"],
-                "credential": st.secrets["TURN_CREDENTIAL"],
-            })
+        raw = base64.b64decode(data_url.split(",", 1)[1])
     except Exception:
-        # No secrets configured (e.g. running locally) or TURN setup failed:
-        # fall back to STUN only.
-        pass
+        return None
 
-    return ice_servers
+    return cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
+def _live_worker(holder, models):
+    """Background thread: always predicts the newest frame (anti-spoofing + recognition).
+
+    Keeps the heavy work out of Streamlit's script run, so slow predictions
+    never block or starve the page. Stops itself when frames stop arriving.
+    """
+
+    last_id = None
+    idle_since = time.time()
+
+    while True:
+
+        with holder["lock"]:
+            frame_id = holder["frame_id"]
+            data = holder["frame_data"]
+
+        if frame_id is None or frame_id == last_id:
+            if time.time() - idle_since > LIVE_IDLE_TIMEOUT:
+                return
+            time.sleep(0.05)
+            continue
+
+        idle_since = time.time()
+        last_id = frame_id
+
+        image_bgr = decode_data_url(data)
+        if image_bgr is None:
+            continue
+
+        try:
+            results = predict_image(image_bgr, models, use_anti_spoofing=True)
+            error = None
+        except Exception as exc:
+            results = None
+            error = str(exc)
+
+        with holder["lock"]:
+            holder["results"] = results
+            holder["error"] = error
 
 
 def run_live_camera(models):
     """Live Camera: anti-spoofing + recognition. The video stays clean,
     predictions update below it."""
 
-    # Latest frame from the browser camera, shared with the video callback thread.
+    live_cam = get_live_cam_component()
+
     if "live_holder" not in st.session_state:
         st.session_state.live_holder = {
-            "frame": None,
-            "count": 0,
             "lock": threading.Lock(),
+            "frame_id": None,
+            "frame_data": None,
+            "results": None,
+            "error": None,
+            "thread": None,
         }
     holder = st.session_state.live_holder
 
-    def video_frame_callback(frame):
-        # Only store the frame (cheap) and return it untouched: no overlays.
-        image_bgr = frame.to_ndarray(format="bgr24")
-        with holder["lock"]:
-            holder["frame"] = image_bgr
-            holder["count"] += 1
-        return frame
-
-    ctx = webrtc_streamer(
-        key="live-camera",
-        mode=WebRtcMode.SENDRECV,
-        video_frame_callback=video_frame_callback,
-        media_stream_constraints={
-            "video": {"width": {"ideal": 1280}, "height": {"ideal": 720}},
-            "audio": False,
-        },
-        rtc_configuration={"iceServers": get_ice_servers()},
-        async_processing=True,
+    # The component shows the camera and returns the newest frame every LIVE_INTERVAL_MS.
+    frame = live_cam(
+        interval_ms=LIVE_INTERVAL_MS,
+        max_width=LIVE_MAX_WIDTH,
+        key="live-cam",
+        default=None
     )
 
-    st.caption("Click START, allow camera access, and predictions update live below the video.")
-
-    result_box = st.empty()
-    last_count = -1
-
-    # Prediction loop: always works on the newest frame, skipping any it can't keep up with.
-    while ctx.state.playing:
-
+    if not frame:
         with holder["lock"]:
-            count = holder["count"]
-            image_bgr = holder["frame"]
+            holder["frame_id"] = None
+            holder["frame_data"] = None
+            holder["results"] = None
+            holder["error"] = None
+        st.info("Click Start camera and allow camera access. Predictions appear here.")
+        return
 
-        if image_bgr is None:
-            result_box.info("Waiting for the camera...")
-            time.sleep(0.1)
-            continue
+    with holder["lock"]:
+        holder["frame_id"] = frame["id"]
+        holder["frame_data"] = frame["data"]
 
-        if count == last_count:
-            time.sleep(0.03)
-            continue
+    thread = holder["thread"]
+    if thread is None or not thread.is_alive():
+        thread = threading.Thread(
+            target=_live_worker,
+            args=(holder, models),
+            daemon=True
+        )
+        holder["thread"] = thread
+        thread.start()
 
-        last_count = count
+    with holder["lock"]:
+        results = holder["results"]
+        error = holder["error"]
 
-        results = predict_image(image_bgr, models, use_anti_spoofing=True)
-
-        with result_box.container():
-            show_results(results)
+    if error:
+        st.error(f"Prediction failed: {error}")
+    elif results is None:
+        st.info("Analyzing...")
+    else:
+        show_results(results)
 
 
 def main():
